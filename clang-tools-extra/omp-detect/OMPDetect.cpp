@@ -2,6 +2,7 @@
 #include "clang/AST/StmtOpenMP.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Lexer.h"
 
 using namespace clang;
 
@@ -15,16 +16,34 @@ void OpenMPRewriter::run(const MatchFinder::MatchResult &Result) {
   const SourceManager &SM = Context->getSourceManager();
   if (!SM.isWrittenInMainFile(S->getBeginLoc())) return;
 
-  if (const auto *OED = dyn_cast<OMPTargetDataDirective>(S)) {
-    SourceRange Range(OED->getBeginLoc(), OED->getEndLoc());
+  if(const auto *OED = dyn_cast<OMPExecutableDirective>(S)){
+    SourceRange Range = OED->getSourceRange();
+    Range.getBegin().dump(SM);
+    Range.getEnd().dump(SM);
+;  }
 
-    std::string Replacement = R"cpp(
-    queue q;
-    sycl::buffer A_buf(A, sycl::range<1>(N));
-    q.submit([&](handler &h) {
-      // original OpenMP code block
-    }); q.wait();
-    )cpp";
+  if (const auto *OED = dyn_cast<OMPTargetDataDirective>(S)) {
+    SourceRange Range = OED->getSourceRange();
+    const Stmt *Body = OED->getAssociatedStmt();
+
+    // 如果Body为空，则不修改
+    if(!Body) return;
+
+    SourceLocation BodyStart = Body->getBeginLoc();
+    SourceLocation BodyEnd = Body->getEndLoc();
+
+    // 提取原始代码为文本
+    CharSourceRange BodyRange = CharSourceRange::getTokenRange(BodyStart, BodyEnd);
+    llvm::StringRef OriginalCode = Lexer::getSourceText(BodyRange, SM, Context->getLangOpts());
+
+    std::string Replacement;
+    llvm::raw_string_ostream OS(Replacement);
+    OS << "sycl::queue q;\n";
+    OS << "q.submit([&](sycl::handler &h) {\n";
+    OS << OriginalCode << "\n";
+    OS << "}).wait();";
+
+    OS.flush(); // 刷新到 Replacement 字符串中
 
     TheRewriter.ReplaceText(Range, Replacement);
   }
