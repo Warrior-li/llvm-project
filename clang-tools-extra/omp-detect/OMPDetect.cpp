@@ -29,10 +29,11 @@ void OpenMPRewriter::run(const MatchFinder::MatchResult &Result) {
     // 如果Body为空，则不修改
     if(!Body) return;
 
+    SourceLocation PragmaLoc = OED->getBeginLoc();
     SourceLocation BodyStart = Body->getBeginLoc();
     SourceLocation BodyEnd = Body->getEndLoc();
 
-    // 提取原始代码为文本
+    // 提取原始代码为文本ni
     CharSourceRange BodyRange = CharSourceRange::getTokenRange(BodyStart, BodyEnd);
     llvm::StringRef OriginalCode = Lexer::getSourceText(BodyRange, SM, Context->getLangOpts());
 
