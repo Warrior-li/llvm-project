@@ -16,38 +16,9 @@ void OpenMPRewriter::run(const MatchFinder::MatchResult &Result) {
   const SourceManager &SM = Context->getSourceManager();
   if (!SM.isWrittenInMainFile(S->getBeginLoc())) return;
 
-  if(const auto *OED = dyn_cast<OMPExecutableDirective>(S)){
-    SourceRange Range = OED->getSourceRange();
-    Range.getBegin().dump(SM);
-    Range.getEnd().dump(SM);
-;  }
-
-  if (const auto *OED = dyn_cast<OMPTargetDataDirective>(S)) {
-    SourceRange Range = OED->getSourceRange();
-    const Stmt *Body = OED->getAssociatedStmt();
-
-    // 如果Body为空，则不修改
-    if(!Body) return;
-
-    SourceLocation PragmaLoc = OED->getBeginLoc();
-    SourceLocation BodyStart = Body->getBeginLoc();
-    SourceLocation BodyEnd = Body->getEndLoc();
-
-    // 提取原始代码为文本ni
-    CharSourceRange BodyRange = CharSourceRange::getTokenRange(BodyStart, BodyEnd);
-    llvm::StringRef OriginalCode = Lexer::getSourceText(BodyRange, SM, Context->getLangOpts());
-
-    std::string Replacement;
-    llvm::raw_string_ostream OS(Replacement);
-    OS << "sycl::queue q;\n";
-    OS << "q.submit([&](sycl::handler &h) {\n";
-    OS << OriginalCode << "\n";
-    OS << "}).wait();";
-
-    OS.flush(); // 刷新到 Replacement 字符串中
-
-    TheRewriter.ReplaceText(Range, Replacement);
-  }
+  // 这里不要直接修改 AST
+  // 开始从这个节点递归向下处理
+  RecursiveRewrite(S, *Context);
 }
 
 HeaderRewriter::HeaderRewriter(Rewriter &R, SourceManager &SM)
@@ -74,13 +45,48 @@ HeaderRewriter::HeaderRewriter(Rewriter &R, SourceManager &SM)
       }
 }
 
-    void HeaderRewriter::EndOfMainFile() {
-      FileID FID = SM.getMainFileID();
-      SourceLocation InsertLoc;
-      if (LastIncludeLoc > 0) {
-        InsertLoc = SM.translateLineCol(FID, LastIncludeLoc + 1, 1);
-      } else {
-        InsertLoc = SM.getLocForStartOfFile(FID);
-      }
-      TheRewriter.InsertText(InsertLoc, "using namespace sycl;\n");
-    }
+void HeaderRewriter::EndOfMainFile() {
+  FileID FID = SM.getMainFileID();
+  SourceLocation InsertLoc;
+  if (LastIncludeLoc > 0) {
+    InsertLoc = SM.translateLineCol(FID, LastIncludeLoc + 1, 1);
+  } else {
+    InsertLoc = SM.getLocForStartOfFile(FID);
+  }
+  TheRewriter.InsertText(InsertLoc, "using namespace sycl;\n");
+}
+
+void OpenMPRewriter::RecursiveRewrite(const Stmt *Node, ASTContext &Context) {
+  if (!Node) return;
+
+  const SourceManager &SM = Context.getSourceManager();
+
+  // 先递归处理子节点
+  for (const Stmt *Child : Node->children()) {
+    RecursiveRewrite(Child, Context);
+  }
+
+  // 再处理自己（后序遍历）
+
+  if (const auto *ParallelFor = dyn_cast<OMPParallelForDirective>(Node)) {
+    // 处理 parallel for
+    SourceLocation Start = ParallelFor->getBeginLoc();
+    SourceLocation End = ParallelFor->getEndLoc();
+    CharSourceRange Range = CharSourceRange::getTokenRange(Start, End);
+    TheRewriter.ReplaceText(Range, "// converted parallel for\n");
+  }
+  else if (const auto *Target = dyn_cast<OMPTargetDirective>(Node)) {
+    // 处理 target
+    SourceLocation Start = Target->getBeginLoc();
+    SourceLocation End = Target->getEndLoc();
+    CharSourceRange Range = CharSourceRange::getTokenRange(Start, End);
+    TheRewriter.ReplaceText(Range, "// converted target\n");
+  }
+  else if (const auto *TargetData = dyn_cast<OMPTargetDataDirective>(Node)) {
+    // 处理 target data
+    SourceLocation Start = TargetData->getBeginLoc();
+    SourceLocation End = TargetData->getEndLoc();
+    CharSourceRange Range = CharSourceRange::getTokenRange(Start, End);
+    TheRewriter.ReplaceText(Range, "// converted target data\n");
+  }
+}

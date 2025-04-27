@@ -13,12 +13,13 @@ class OpenMPRewriter : public MatchFinder::MatchCallback {
     public:
       OpenMPRewriter(Rewriter &R);
       void run(const MatchFinder::MatchResult &Result) override;
+      void RecursiveRewrite(const Stmt *Node, ASTContext &Context);
     
     private:
       Rewriter &TheRewriter;
-    };
+};
     
-    class HeaderRewriter : public PPCallbacks {
+class HeaderRewriter : public PPCallbacks {
     public:
       HeaderRewriter(Rewriter &R, SourceManager &SM);
       void InclusionDirective(SourceLocation HashLoc,
@@ -33,11 +34,17 @@ class OpenMPRewriter : public MatchFinder::MatchCallback {
                               bool FileIsImport,
                               SrcMgr::CharacteristicKind FileType) override;
       void EndOfMainFile() override;
-    
+
     private:
       Rewriter &TheRewriter;
       SourceManager &SM;
       unsigned LastIncludeLoc;
 };
-    
+
+
+class OMPDirectiveInfo {
+  const Stmt *Node;
+  enum class Kind {TargetData, Target, ParalleFor } Type;
+};
+
 #endif // OPENMP_H
