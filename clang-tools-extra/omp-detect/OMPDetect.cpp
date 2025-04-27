@@ -47,13 +47,19 @@ HeaderRewriter::HeaderRewriter(Rewriter &R, SourceManager &SM)
 
 void HeaderRewriter::EndOfMainFile() {
   FileID FID = SM.getMainFileID();
-  SourceLocation InsertLoc;
+  SourceLocation InsertLoc, QueueLoc;
   if (LastIncludeLoc > 0) {
+    // using name space location
     InsertLoc = SM.translateLineCol(FID, LastIncludeLoc + 1, 1);
+    // queue location
+    QueueLoc = SM.translateLineCol(FID, LastIncludeLoc + 2, 1);
   } else {
     InsertLoc = SM.getLocForStartOfFile(FID);
+    QueueLoc = SM.translateLineCol(FID, 1, 1);
   }
+
   TheRewriter.InsertText(InsertLoc, "using namespace sycl;\n");
+  TheRewriter.InsertText(InsertLoc, "\nsycl::queue q\n");
 }
 
 void OpenMPRewriter::RecursiveRewrite(const Stmt *Node, ASTContext &Context) {
