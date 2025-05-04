@@ -7,28 +7,59 @@
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Format/Format.h"
 
 using namespace clang;
 using namespace clang::tooling;
 using namespace clang::ast_matchers;
+using namespace clang::format;
 
 static llvm::cl::OptionCategory ToolCategory("omp-to-sycl options");
 
 class MyFrontendAction : public ASTFrontendAction {
 public:
   void EndSourceFileAction() override {
-    FileID FID = TheRewriter.getSourceMgr().getMainFileID();
-    TheRewriter.getEditBuffer(FID).write(llvm::outs());
+    const SourceManager &SM = TheRewriter.getSourceMgr();
+    FileID                FID = SM.getMainFileID();
+
+    // 1. 取改动后的文本；若文件从未被改动，则取原源码
+    std::string Code;
+    if (const llvm::RewriteBuffer *RB = TheRewriter.getRewriteBufferFor(FID)) {
+      Code.assign(RB->begin(), RB->end());                  // Rewriter 结果
+    } else {
+      Code = SM.getBufferOrFake(FID).getBuffer().str();                        // 原文件文本
+    }
+
+    FormatStyle Style = getLLVMStyle();          // ← 直接 LLVM 风格
+
+
+    clang::tooling::Range Whole(0, Code.size());
+    auto Repls = clang::format::reformat(Style, Code, {Whole});
+
+    // 4. 应用补丁得到排版后代码
+    auto Formatted = clang::tooling::applyAllReplacements(Code, Repls);
+    if (!Formatted) {
+      llvm::errs() << llvm::toString(Formatted.takeError());
+      return;
+    }
+
+    //------------------------------------------------------------
+    // 5. 输出
+    //------------------------------------------------------------
+    llvm::outs() << *Formatted;
   }
+
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef) override {
     TheRewriter.setSourceMgr(CI.getSourceManager(), CI.getLangOpts());
+
+    SM = &CI.getSourceManager();
 
     // 插入头文件处理器
     CI.getPreprocessor().addPPCallbacks(std::make_unique<HeaderRewriter>(TheRewriter, CI.getSourceManager()));
 
     auto Callback = std::make_unique<OpenMPRewriter>(TheRewriter);
-    Finder.addMatcher(stmt().bind("stmt"), Callback.get());
+    Finder.addMatcher(translationUnitDecl().bind("tu"), Callback.get());
     Callbacks.push_back(std::move(Callback));
 
     return Finder.newASTConsumer();
@@ -38,6 +69,7 @@ private:
   Rewriter TheRewriter;
   MatchFinder Finder;
   std::vector<std::unique_ptr<MatchFinder::MatchCallback>> Callbacks;
+  clang::SourceManager *SM = nullptr;
 };
 
 int main(int argc, const char **argv) {

@@ -16,6 +16,7 @@ class OpenMPRewriter : public MatchFinder::MatchCallback {
       void RecursiveRewrite(const Stmt *Node, ASTContext &Context);
       void rewriteParallelFor(const OMPTargetParallelForDirective *ParallelFor, ASTContext &Context);
       void rewriteTargetData(const OMPTargetDataDirective *TD, ASTContext &Context);
+      void rewriteTeamsDistributeParallelFor(const OMPTargetTeamsDistributeParallelForDirective *TDPF, ASTContext &Context);
     
     private:
       Rewriter &TheRewriter;
