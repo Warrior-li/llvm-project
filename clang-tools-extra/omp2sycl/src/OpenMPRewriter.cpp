@@ -5,6 +5,7 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 #include <clang/Lex/Lexer.h>
+#include <llvm/ADT/SmallString.h>
 #include <unordered_map>
 
 using namespace clang;
@@ -36,11 +37,11 @@ void OpenMPRewriter::recursiveRewrite(const Stmt *Node, ASTContext &Ctx) {
   for (const Stmt *Child : Node->children())
     recursiveRewrite(Child, Ctx);
 
-  if (const auto *CS = dyn_cast<CapturedStmt>(Node))
-    recursiveRewrite(CS->getCapturedStmt(), Ctx);
+  // if (const auto *CS = dyn_cast<CapturedStmt>(Node))
+  //   recursiveRewrite(CS->getCapturedStmt(), Ctx);
 
-  if (const auto *PF = dyn_cast<OMPTargetParallelForDirective>(Node))
-    return rewriteParallelFor(PF, Ctx);
+  // if (const auto *PF = dyn_cast<OMPTargetParallelForDirective>(Node))
+  //   return rewriteParallelFor(PF, Ctx);
 
   if (const auto *TD = dyn_cast<OMPTargetDataDirective>(Node))
     return rewriteTargetData(TD, Ctx);
@@ -96,77 +97,114 @@ void OpenMPRewriter::rewriteParallelFor(
 
 /* ──────────────────────────────  target data  ─────────────────────────── */
 void OpenMPRewriter::rewriteTargetData(const OMPTargetDataDirective *TD,
-                                       ASTContext &Context) {
+                                       ASTContext &Ctx) {
   using namespace detail;
-  const SourceManager &SM = Context.getSourceManager();
+  const SourceManager &SM = Ctx.getSourceManager();
 
-  // 记录变量的信息
-  struct Info {std::string Len, Mode; int Pri;};
-  // —— 收集独立变量名 → buffer / accessor 生成
+  // -------- 0. 收集变量信息 (Name→{LenExpr, Mode, Pri}) ---------------- //
+  struct Info { std::string Len, Mode; int Pri = 0; };
   std::unordered_map<std::string, Info> Vars;
 
-  //合并函数
-  auto merge = [&](std::string Name, std::string Len, llvm::StringRef Mode, int Pri){
+  auto merge = [&](std::string Name, std::string Len,
+                   llvm::StringRef Mode, int Pri) {
     auto &I = Vars[Name];
-    if(I.Len.empty()) I.Len = std::move(Len);
-    if(Pri > I.Pri) {I.Mode = Mode.str(); I.Pri = Pri;}
+    if (I.Len.empty()) I.Len = std::move(Len);
+    if (Pri > I.Pri) { I.Mode = Mode.str(); I.Pri = Pri; }
   };
 
+  for (const OMPClause *C : TD->clauses()) {
+    const auto *MC = dyn_cast<OMPMapClause>(C);
+    if (!MC) continue;
+
+    llvm::StringRef Mode = mapTypeToMode(MC->getMapType());
+    int Pri = (MC->getMapType() == OMPC_MAP_to   ) ? 1 :
+              (MC->getMapType() == OMPC_MAP_from ) ? 2 : 3;
+
+
+    for (const Expr *Raw : MC->varlist()) {
+
+      // ---- a. 解析表达式 ------------------------------------------------ //
+      const Expr *E    = Raw->IgnoreParenImpCasts();
+      const Expr *Base = E;
+      const Expr *LenE = nullptr;          // 切片长度表达式 (may be null)
+      bool IsSubscript = false;
+
+      if (auto *Sec = dyn_cast<ArraySectionExpr>(E)) {
+        Base = Sec->getBase()->IgnoreParenImpCasts();
+        LenE = Sec->getLength();           // A[:len] A[lb:len]
+      }
+      else if (auto *Sub = dyn_cast<ArraySubscriptExpr>(E)) {
+        Base = Sub->getBase()->IgnoreImpCasts();
+        IsSubscript = true;                // A[idx]
+      }
+
+      const auto *DR = dyn_cast<DeclRefExpr>(Base);
+      if (!DR) continue;                   // 复杂表达式暂不支持
+
+      // 打印源代码
+      clang::CharSourceRange Ran = clang::CharSourceRange::getTokenRange(DR->getBeginLoc(),DR->getEndLoc());
+      llvm::outs() << Lexer::getSourceText(Ran, SM, Ctx.getLangOpts()) << "\n\n";
+
+      std::string Name = DR->getNameInfo().getAsString();
+      std::string LenStr;
+
+      // ---- b. 决定元素个数表达式 --------------------------------------- //
+      if (IsSubscript) {
+        LenStr = "1";                      // 单元素
+      } else if (LenE) {
+        LenStr = Lexer::getSourceText(
+                   CharSourceRange::getTokenRange(LenE->getSourceRange()),
+                   SM, Ctx.getLangOpts()).str();
+        if (LenStr.empty())
+          LenStr = "/* TODO:len_" + Name + " */";
+      } else if (const auto *CAT =
+                 dyn_cast<ConstantArrayType>(DR->getType().getTypePtr())) {
+        llvm::APInt Sz = CAT->getSize();    // 元素个数（任意位宽无符号整数）
+        if (Sz.getActiveBits() <= 63) {
+          // ≤64 bit 时可直接转成 uint64，再用 std::to_string
+          LenStr = std::to_string(Sz.getZExtValue());
+        } else {
+          // 大整数：用 SmallString 接收
+          llvm::SmallString<32> Tmp;
+          Sz.toString(Tmp, /*Radix=*/10, /*Signed=*/false);
+          LenStr = std::string(Tmp);
+        }
+      } else {
+        LenStr = "/* TODO:len_" + Name + " */";   // 退化指针
+      }
+
+      merge(Name, LenStr, Mode, Pri);
+    }
+  }
+
+  // -------- 1. 生成重写代码 ------------------------------------------------ //
+  std::string Prologue; llvm::raw_string_ostream PO(Prologue);
+  PO << "sycl::queue q;\n";
+  for (auto &[Name, I] : Vars)
+    PO << "sycl::buffer " << Name << "_buf(" << Name
+       << ", sycl::range<1>(" << I.Len << "));\n";
+  PO.flush();
+
+  // 原始 pragma body
   const Stmt *BodyStmt = unwrapCaptured(TD->getAssociatedStmt());
   if (!BodyStmt) return;
-
   std::string BodyCode = TheRewriter.getRewrittenText(
       CharSourceRange::getTokenRange(BodyStmt->getSourceRange()));
 
-  std::string Prologue;
-  llvm::raw_string_ostream PO(Prologue);
-  PO << "sycl::queue q;\n";
-
-
-  for (const OMPClause *C : TD->clauses()) {
-    auto *MC = dyn_cast<OMPMapClause>(C);
-    if(!MC) continue;
-
-    llvm::StringRef Mode = mapTypeToMode(MC->getMapType());
-    int Prio = (MC->getMapType() == OMPC_MAP_to) ? 1 : (MC->getMapType() == OMPC_MAP_from ) ? 2 : 3;
-
-    for(const Expr *RawE : MC->varlist()){
-      const Expr *E = RawE->IgnoreParenImpCasts();
-      const Expr *Base = E;
-      const Expr *Len  = nullptr;            // ← 我们要找的“元素个数”表达式
-
-      /* ---- ① A[:len] or A[lb:len] ---- */
-      if (auto *Sec = dyn_cast<ArraySectionExpr>(E)) {
-        Base = Sec->getBase()->IgnoreParenImpCasts();
-        Len = Sec->getLength();                        // A[:Len]
-        Len->dump();
-      }
-
-
-    }
-  }
-  PO.flush();
-
-  std::string Out;
-  llvm::raw_string_ostream OS(Out);
+  std::string Out; llvm::raw_string_ostream OS(Out);
   OS << Prologue;
   OS << "q.submit([&](sycl::handler &h){\n";
-  for (const auto &V : Vars)
-    OS << "  auto " << V << " = " << V
-       << "_buf.get_access<sycl::access::mode::read_write>(h);\n";
+  for (auto &[Name, I] : Vars)
+    OS << "  auto " << Name << " = " << Name
+       << "_buf.get_access<sycl::access::mode::" << I.Mode << ">(h);\n";
   OS << BodyCode << "\n}).wait();";
   OS.flush();
 
+  llvm::outs() << Out;
+
   TheRewriter.ReplaceText(
-      CharSourceRange::getTokenRange(TD->getBeginLoc(),
-                                     BodyStmt->getEndLoc()),
+      CharSourceRange::getTokenRange(TD->getBeginLoc(), BodyStmt->getEndLoc()),
       Out);
 }
 
-/* ──────────────────────────────────────────────────────────────────────── */
-
-std::unique_ptr<IRewriter> makeOpenMPRewriter(Rewriter &R) {
-  return std::make_unique<OpenMPRewriter>(R);
 }
-
-} // namespace Omp2Sycl
